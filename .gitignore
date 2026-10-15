@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 仮想環境
+.venv/
+venv/
+
+# ビルド関連
+build/
+dist/
+*.egg-info/
+
+# 個人の開発環境
+.vscode/
+.idea/

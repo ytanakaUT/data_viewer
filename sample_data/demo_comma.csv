@@ -1,0 +1,8 @@
+# measurement: test
+# unit: SI
+Field,Temperature,Voltage
+0,0.5,0.001
+1,0.6,0.0015
+2,0.7,0.0025
+3,0.8,0.0033
+4,0.9,0.0042
