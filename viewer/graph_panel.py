@@ -12,6 +12,7 @@ from .formula import calculate_xy, FormulaError
 from .dialogs import AxisDialog, message_error
 from .plot_viewbox import MiddlePanViewBox
 from .curve_style import plot_kwargs
+from .plot_optimization import prepare_plot_data
 
 
 class ClickableAxis(pg.AxisItem):
@@ -78,6 +79,7 @@ class GraphPanel(QtWidgets.QWidget):
         self.curves: list[CurveSpec] = []
         self.items: dict[str, pg.PlotDataItem] = {}
         self.values: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.display_values: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._marker_items: list[pg.TargetItem] = []
         self._markers: list[tuple[float, float]] = []
         self._marking_guard = False
@@ -261,6 +263,7 @@ class GraphPanel(QtWidgets.QWidget):
             self._push_previous()
         self._changing_range = True
         try:
+            previous_x_log = self.x_log
             self.title_text = settings.get("title", self.title_text)
             self.xlabel = settings.get("xlabel", self.xlabel)
             self.ylabel = settings.get("ylabel", self.ylabel)
@@ -271,6 +274,18 @@ class GraphPanel(QtWidgets.QWidget):
             self.plot_item.setTitle(self.title_text)
             self.plot_item.setLabel("bottom", self.xlabel)
             self.plot_item.setLabel("left", self.ylabel)
+            # X対数設定の変更時は最適化の安全性も再判定する。
+            # (X<=0の値はlog変換で非有限になるため、clipToViewは使用しない。)
+            if previous_x_log != self.x_log:
+                for curve in self.curves:
+                    item = self.items.get(curve.id)
+                    if item is None or curve.id not in self.values:
+                        continue
+                    x, y = self.values[curve.id]
+                    plan = prepare_plot_data(x, y, x_log=self.x_log)
+                    self._configure_plot_item(item, plan)
+                    item.setData(plan.x, plan.y, **plot_kwargs(curve))
+                    self.display_values[curve.id] = (plan.x, plan.y)
             self.plot_item.setLogMode(x=self.x_log, y=self.y_log)
             self.plot_item.showGrid(x=self.show_grid, y=self.show_grid, alpha=0.2)
             for idx, axis in enumerate("xy"):
@@ -312,31 +327,42 @@ class GraphPanel(QtWidgets.QWidget):
             if self.plot_item.legend is not None:
                 self.plot_item.legend.removeItem(item)
         self.values.pop(curve_id, None)
+        self.display_values.pop(curve_id, None)
         self.clear_markers()
         self.changed.emit(self.graph_id)
+
+    @staticmethod
+    def _configure_plot_item(item: pg.PlotDataItem, plan) -> None:
+        """Xが非単調な曲線には、昇順を前提とした高速化を適用しない。"""
+        item.setClipToView(plan.clip_to_view)
+        item.setDownsampling(ds=1, auto=plan.auto_downsample, method="peak")
 
     def set_curve_data(self, spec: CurveSpec, record: DataRecord) -> None:
         x, y = calculate_xy(record.array, spec.columns, spec.use_formula,
                             spec.x_expr, spec.y_expr)
+        # 元データは解析・マーカー用にそのまま保持する。
         self.values[spec.id] = (x, y)
+        plan = prepare_plot_data(x, y, x_log=self.x_log)
+        self.display_values[spec.id] = (plan.x, plan.y)
         item = self.items.get(spec.id)
         options = plot_kwargs(spec)
         if item is None:
-            item = self.plot_item.plot(x, y, name=spec.name, **options)
+            item = self.plot_item.plot(plan.x, plan.y, name=spec.name, **options)
             # 線は線上を、点表示の場合はマーカーをダブルクリックして編集できる。
             item.setCurveClickable(True, width=10)
             item.sigClicked.connect(lambda _, ev, cid=spec.id: self._curve_clicked(cid, ev))
-            item.setClipToView(True)
-            item.setDownsampling(auto=True, method="peak")
             self.items[spec.id] = item
         else:
+            # 変更後のXの並びに応じた設定を、setDataより先に適用する。
+            self._configure_plot_item(item, plan)
             # pen / symbol を毎回明示して、線のみ⇔点のみ切替時に古い表示を残さない。
-            item.setData(x, y, **options)
+            item.setData(plan.x, plan.y, **options)
             item.opts["name"] = spec.name
             legend = self.plot_item.legend
             if legend is not None:
                 legend.removeItem(item)
                 legend.addItem(item, spec.name)
+        self._configure_plot_item(item, plan)
         item.setVisible(spec.visible)
         self.information.setText(f"曲線: {len(self.curves)}本（ダブルクリックでプロパティ）")
         self.clear_markers()
@@ -493,7 +519,7 @@ class GraphPanel(QtWidgets.QWidget):
             item = self.items.get(curve.id)
             if item is not None:
                 # データの再計算やディスクの読み直しをせず、見た目だけ変更。
-                item.setData(*self.values[curve.id], **plot_kwargs(curve))
+                item.setData(*self.display_values[curve.id], **plot_kwargs(curve))
                 legend = self.plot_item.legend
                 if legend is not None:
                     legend.removeItem(item)

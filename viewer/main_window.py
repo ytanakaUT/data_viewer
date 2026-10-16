@@ -18,7 +18,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Measurement Viewer v0.1.2")
+        self.setWindowTitle("Measurement Viewer v0.1.5")
         self.resize(1450, 850)
         self.data_manager = DataManager(self)
         self.data_manager.loaded.connect(self._on_data_loaded)

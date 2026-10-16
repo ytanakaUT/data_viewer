@@ -6,7 +6,9 @@ from PySide6 import QtWidgets, QtCore, QtGui
 
 from .models import ReaderOptions, CurveSpec, DataRecord
 from .curve_style import PLOT_STYLES
-from .reader import preview_lines, preview_table
+from .reader import (
+    QUICKLOOK_RAW_LINES, QUICKLOOK_TABLE_ROWS, preview_lines, preview_table
+)
 
 
 def message_error(parent, title: str, details: str):
@@ -19,17 +21,18 @@ class ReaderDialog(QtWidgets.QDialog):
     def __init__(self, path: str, options: ReaderOptions, parent=None):
         super().__init__(parent)
         self.setWindowTitle("データのクイックルック / 読み込み設定")
-        self.resize(780, 650)
+        self.resize(820, 760)
         self.path = path
         self.lines = []
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(QtWidgets.QLabel(path))
         self.raw = QtWidgets.QPlainTextEdit()
         self.raw.setReadOnly(True)
-        self.raw.setMaximumHeight(175)
+        self.raw.setMinimumHeight(260)
+        self.raw.setMaximumHeight(350)
         font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
         self.raw.setFont(font)
-        layout.addWidget(QtWidgets.QLabel("ファイル先頭（最初の35行）"))
+        layout.addWidget(QtWidgets.QLabel(f"ファイル先頭（最初の{QUICKLOOK_RAW_LINES}行）"))
         layout.addWidget(self.raw)
         form = QtWidgets.QFormLayout()
         self.delimiter = QtWidgets.QComboBox()
@@ -54,7 +57,7 @@ class ReaderDialog(QtWidgets.QDialog):
         form.addRow("列名に使用する行（0=最終ヘッダー行）", self.name_line)
         form.addRow("文字コード", self.encoding)
         layout.addLayout(form)
-        layout.addWidget(QtWidgets.QLabel("数値部分のプレビュー（先頭12行）"))
+        layout.addWidget(QtWidgets.QLabel(f"数値部分のプレビュー（先頭{QUICKLOOK_TABLE_ROWS}行）"))
         self.table = QtWidgets.QTableWidget()
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table)
@@ -66,9 +69,10 @@ class ReaderDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         for widget, signal in [(self.delimiter, self.delimiter.currentIndexChanged),
-                               (self.header, self.header.valueChanged),
                                (self.name_line, self.name_line.valueChanged)]:
             signal.connect(self.update_preview)
+        # ヘッダーが50行以上のファイルでも、ヘッダーより後ろの数値行をプレビューする。
+        self.header.valueChanged.connect(self._read_text)
         self.encoding.currentTextChanged.connect(self._read_text)
         self._read_text()
 
@@ -78,8 +82,13 @@ class ReaderDialog(QtWidgets.QDialog):
 
     def _read_text(self):
         try:
-            self.lines = preview_lines(self.path, 35, self.encoding.currentText())
-            self.raw.setPlainText("\n".join(f"{i+1:>3}: {line}" for i, line in enumerate(self.lines)))
+            # ヘッダー行数が大きくても、数値部分のプレビュー分まで先読みする。
+            # ただし上段の生テキスト表示は先頭50行に固定する。
+            count = max(QUICKLOOK_RAW_LINES, self.header.value() + QUICKLOOK_TABLE_ROWS + 10)
+            self.lines = preview_lines(self.path, count, self.encoding.currentText())
+            self.raw.setPlainText("\n".join(
+                f"{i+1:>3}: {line}" for i, line in enumerate(self.lines[:QUICKLOOK_RAW_LINES])
+            ))
             self.update_preview()
         except Exception as exc:
             self.lines = []
