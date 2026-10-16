@@ -6,13 +6,33 @@ from PySide6 import QtCore
 
 
 class MiddlePanViewBox(pg.ViewBox):
+    selectionFinished = QtCore.Signal(float, float, float, float)
     """マウス中央ボタンで、表示モードにかかわらずPanするViewBox。
 
     pyqtgraph標準のRectModeでは中央ドラッグまで範囲拡大になるため、
     中央ボタンだけ処理を上書きする。左ドラッグとホイール操作は標準実装を使う。
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.point_selection_mode = False
+
     def mouseDragEvent(self, ev, axis=None):
+        # 部分消去モードでは左ドラッグはズームではなく点の矩形選択。
+        # 中央ドラッグのPanは全モード共通で維持。
+        if (self.point_selection_mode and axis is None and
+                ev.button() == QtCore.Qt.MouseButton.LeftButton):
+            ev.accept()
+            if ev.isFinish():
+                self.rbScaleBox.hide()
+                a = self.mapToView(ev.buttonDownPos())
+                b = self.mapToView(ev.pos())
+                self.selectionFinished.emit(min(a.x(), b.x()), max(a.x(), b.x()),
+                                            min(a.y(), b.y()), max(a.y(), b.y()))
+            else:
+                self.updateScaleBox(ev.buttonDownPos(), ev.pos())
+            return
+
         if ev.button() != QtCore.Qt.MouseButton.MiddleButton:
             # 範囲モードでは左ドラッグで矩形拡大、Panモードでは左ドラッグで移動。
             super().mouseDragEvent(ev, axis=axis)

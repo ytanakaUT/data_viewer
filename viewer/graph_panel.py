@@ -13,6 +13,10 @@ from .dialogs import AxisDialog, message_error
 from .plot_viewbox import MiddlePanViewBox
 from .curve_style import plot_kwargs
 from .plot_optimization import prepare_plot_data
+from .legend_interaction import curve_id_at_legend_label
+from .font_settings import FONT_SIZE_DEFAULTS, get_font_sizes
+from .point_selection import (visible_mask, masked_y, rectangle_indices,
+                              hide_indices, visible_bounds)
 
 
 class ClickableAxis(pg.AxisItem):
@@ -61,6 +65,7 @@ class GraphPanel(QtWidgets.QWidget):
     fileDropped = QtCore.Signal(str, str)   # graph_id, path
     editCurve = QtCore.Signal(str, str)     # graph_id, curve_id
     saveRequested = QtCore.Signal(str)
+    duplicateRequested = QtCore.Signal(str)
     exportRequested = QtCore.Signal(str)
     templateRequested = QtCore.Signal(str)
     saveTemplateRequested = QtCore.Signal(str)
@@ -76,11 +81,17 @@ class GraphPanel(QtWidgets.QWidget):
         self.x_log = False
         self.y_log = False
         self.show_grid = True
+        self.title_font_size = FONT_SIZE_DEFAULTS["title_font_size"]
+        self.label_font_size = FONT_SIZE_DEFAULTS["label_font_size"]
+        self.tick_font_size = FONT_SIZE_DEFAULTS["tick_font_size"]
         self.curves: list[CurveSpec] = []
         self.items: dict[str, pg.PlotDataItem] = {}
         self.values: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.display_values: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._marker_items: list[pg.TargetItem] = []
+        # 選択は一時的な操作状態。非表示の行番号はCurveSpecに保持する。
+        self.selected_points: dict[str, set[int]] = {}
+        self.selection_items: dict[str, pg.ScatterPlotItem] = {}
         self._markers: list[tuple[float, float]] = []
         self._marking_guard = False
         self._history: list[list[list[float]]] = []
@@ -100,7 +111,8 @@ class GraphPanel(QtWidgets.QWidget):
         self.menu_button.setToolTip("グラフの保存・設定・削除")
         self.menu_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QtWidgets.QMenu(self)
-        for label, signal in [("グラフを保存（JSON）", self.saveRequested),
+        for label, signal in [("グラフを複製", self.duplicateRequested),
+                              ("グラフを保存（JSON）", self.saveRequested),
                               ("画像として出力（PNG / SVG）", self.exportRequested),
                               ("テンプレートを適用", self.templateRequested),
                               ("現在の設定をテンプレート保存", self.saveTemplateRequested),
@@ -114,11 +126,13 @@ class GraphPanel(QtWidgets.QWidget):
         tools.setSpacing(3)
         self.mode_group = QtWidgets.QButtonGroup(self)
         self.mode_group.setExclusive(True)
-        for key, text in [("rect", "範囲"), ("pan", "Pan"), ("marker", "2点測定")]:
+        for key, text in [("rect", "範囲"), ("pan", "Pan"), ("marker", "2点測定"),
+                          ("select", "部分消去")]:
             button = QtWidgets.QToolButton()
             button.setText(text)
             button.setToolTip({"rect": "左ドラッグで範囲拡大／中央ドラッグでPan", "pan": "左ドラッグで移動",
-                               "marker": "クリックで2点配置。マーカーはドラッグ可能"}[key])
+                               "marker": "クリックで2点配置。マーカーはドラッグ可能",
+                               "select": "左ドラッグで範囲内の点を選択／Ctrl+クリックで1点の選択を切替"}[key])
             button.setCheckable(True)
             self.mode_group.addButton(button)
             button.clicked.connect(lambda checked=False, m=key: self.set_mode(m))
@@ -136,6 +150,28 @@ class GraphPanel(QtWidgets.QWidget):
         curve_button.setToolTip("曲線を一覧から選んでプロパティを編集")
         curve_button.clicked.connect(self.choose_curve)
         tools.addWidget(curve_button)
+        # 画面を4分割しても操作ボタンが横にはみ出さないよう、
+        # 部分消去用の3ボタンはモード専用の2段目にまとめる。
+        mask_toolbar = QtWidgets.QWidget(self)
+        mask_tools = QtWidgets.QHBoxLayout(mask_toolbar)
+        mask_tools.setContentsMargins(0, 0, 0, 0)
+        mask_tools.setSpacing(3)
+        self.mask_toolbar = mask_toolbar
+        self.hide_points_button = QtWidgets.QToolButton()
+        self.hide_points_button.setText("選択点を非表示")
+        self.hide_points_button.setToolTip("部分消去モードで選択した点だけを非表示にする")
+        self.hide_points_button.clicked.connect(self.hide_selected_points)
+        mask_tools.addWidget(self.hide_points_button)
+        self.restore_points_button = QtWidgets.QToolButton()
+        self.restore_points_button.setText("すべて表示")
+        self.restore_points_button.setToolTip("このグラフの部分消去を取り消し、すべての点を復元")
+        self.restore_points_button.clicked.connect(self.show_all_points)
+        mask_tools.addWidget(self.restore_points_button)
+        self.clear_selection_button = QtWidgets.QToolButton()
+        self.clear_selection_button.setText("選択解除")
+        self.clear_selection_button.clicked.connect(self.clear_point_selection)
+        mask_tools.addWidget(self.clear_selection_button)
+        mask_tools.addStretch()
         clear_button = QtWidgets.QToolButton()
         clear_button.setText("マーカー消去")
         clear_button.clicked.connect(self.clear_markers)
@@ -145,6 +181,8 @@ class GraphPanel(QtWidgets.QWidget):
         tools.addWidget(self.hover_box)
         tools.addStretch()
         layout.addLayout(tools)
+        layout.addWidget(mask_toolbar)
+        mask_toolbar.hide()
 
         self.axis_x = ClickableAxis(orientation="bottom")
         self.axis_y = ClickableAxis(orientation="left")
@@ -155,13 +193,15 @@ class GraphPanel(QtWidgets.QWidget):
         self.plot.setBackground("w")
         self.plot_item = self.plot.getPlotItem()
         self.plot_item.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_item.setTitle(title)
-        self.plot_item.setLabel("bottom", "X")
-        self.plot_item.setLabel("left", "Y")
+        self._update_labels_and_fonts()
         self.plot_item.addLegend(offset=(10, 10))
+        # 凡例の文字だけをダブルクリックしてもプロパティを開けるようにする。
+        # イベントはviewport側で受け、既存の曲線のダブルクリックとは干渉しない。
+        self.plot.viewport().installEventFilter(self)
         self.vb = self.plot_item.getViewBox()
         self.vb.setMouseMode(pg.ViewBox.RectMode)
         self.vb.setMenuEnabled(False)
+        self.vb.selectionFinished.connect(self.select_rectangle)
         self.plot.fileDropped.connect(lambda p: self.fileDropped.emit(self.graph_id, p))
         self.axis_x.clicked.connect(self.edit_axes)
         self.axis_y.clicked.connect(self.edit_axes)
@@ -187,8 +227,25 @@ class GraphPanel(QtWidgets.QWidget):
         self.mode = "rect"
         self._last_stable_range = self._range_snapshot()
 
+    def eventFilter(self, watched, event):
+        """凡例の文字を左ダブルクリックしたときだけ曲線の編集を要求する。"""
+        if (watched is self.plot.viewport()
+                and event.type() == QtCore.QEvent.Type.MouseButtonDblClick
+                and event.button() == QtCore.Qt.MouseButton.LeftButton):
+            # QWidgetのマウス座標をpyqtgraphのシーン座標へ変換する。
+            scene_position = self.plot.mapToScene(event.position().toPoint())
+            curve_id = curve_id_at_legend_label(
+                self.plot_item.legend, scene_position, self.items
+            )
+            if curve_id is not None:
+                self.editCurve.emit(self.graph_id, curve_id)
+                return True  # 凡例側で不要なドラッグ・ズーム操作をさせない
+        return super().eventFilter(watched, event)
+
     def set_mode(self, mode: str):
         self.mode = mode
+        self.vb.point_selection_mode = mode == "select"
+        self.mask_toolbar.setVisible(mode == "select")
         self.vb.setMouseMode(pg.ViewBox.PanMode if mode in ("pan", "marker")
                              else pg.ViewBox.RectMode)
 
@@ -221,11 +278,30 @@ class GraphPanel(QtWidgets.QWidget):
         self._history = self._history[-100:]
 
     def auto_range(self):
+        # pyqtgraphの標準autoRangeは非表示（NaN）の点のX境界を考慮する
+        # 場合があるため、有効な可視点のみから範囲を明示的に計算する。
+        datasets = []
+        for curve in self.curves:
+            if not curve.visible or curve.id not in self.values:
+                continue
+            x, y = self.values[curve.id]
+            datasets.append((x, masked_y(y, curve.hidden_indices)))
+        bounds = visible_bounds(datasets, self.x_log, self.y_log)
+        if bounds is None:
+            return
+        xmin, xmax, ymin, ymax = bounds
+        # 一定値のみでも正常な矩形領域になるようにする。
+        if xmin == xmax:
+            pad = max(abs(xmin) * .02, .01)
+            xmin, xmax = xmin-pad, xmax+pad
+        if ymin == ymax:
+            pad = max(abs(ymin) * .02, .01)
+            ymin, ymax = ymin-pad, ymax+pad
         self._push_previous()
         self._changing_range = True
         try:
-            self.vb.enableAutoRange()
-            self.vb.autoRange()
+            self.vb.disableAutoRange()
+            self.vb.setRange(xRange=(xmin, xmax), yRange=(ymin, ymax), padding=0.02)
         finally:
             self._changing_range = False
         self._last_stable_range = self._range_snapshot()
@@ -242,11 +318,28 @@ class GraphPanel(QtWidgets.QWidget):
             self._changing_range = False
         self._last_stable_range = self._range_snapshot()
 
+    def _update_labels_and_fonts(self):
+        """Qt/pyqtgraphへ文字サイズをまとめて適用する（X/Y共通）。"""
+        self.plot_item.setTitle(self.title_text, size=f"{self.title_font_size}pt")
+        label_style = {"font-size": f"{self.label_font_size}pt"}
+        self.plot_item.setLabel("bottom", self.xlabel, **label_style)
+        self.plot_item.setLabel("left", self.ylabel, **label_style)
+        tick_font = QtGui.QFont(self.plot.font())
+        tick_font.setPointSize(self.tick_font_size)
+        self.axis_x.setTickFont(tick_font)
+        self.axis_y.setTickFont(tick_font)
+        # フォント変更後は目盛りが収まるように軸の占有幅を再計算。
+        self.axis_x.setHeight(None)
+        self.axis_y.setWidth(None)
+
     def settings(self) -> dict:
         ranges = self.vb.viewRange()
         def physical(value, is_log):
             return float(10 ** value) if is_log else float(value)
         return {"title": self.title_text, "xlabel": self.xlabel, "ylabel": self.ylabel,
+                "title_font_size": self.title_font_size,
+                "label_font_size": self.label_font_size,
+                "tick_font_size": self.tick_font_size,
                 "x_log": self.x_log, "y_log": self.y_log, "grid": self.show_grid,
                 "x_min": physical(ranges[0][0], self.x_log),
                 "x_max": physical(ranges[0][1], self.x_log),
@@ -259,6 +352,8 @@ class GraphPanel(QtWidgets.QWidget):
             self.apply_settings(dialog.settings())
 
     def apply_settings(self, settings: dict, record_history: bool = True):
+        # 先に検証する。保存済み設定が不正でも途中まで表示を変えない。
+        sizes = get_font_sizes(settings, self.settings())
         if record_history:
             self._push_previous()
         self._changing_range = True
@@ -271,9 +366,10 @@ class GraphPanel(QtWidgets.QWidget):
             self.y_log = bool(settings.get("y_log", self.y_log))
             self.show_grid = bool(settings.get("grid", self.show_grid))
             self.title_label.setText(self.title_text)
-            self.plot_item.setTitle(self.title_text)
-            self.plot_item.setLabel("bottom", self.xlabel)
-            self.plot_item.setLabel("left", self.ylabel)
+            self.title_font_size = sizes["title_font_size"]
+            self.label_font_size = sizes["label_font_size"]
+            self.tick_font_size = sizes["tick_font_size"]
+            self._update_labels_and_fonts()
             # X対数設定の変更時は最適化の安全性も再判定する。
             # (X<=0の値はlog変換で非有限になるため、clipToViewは使用しない。)
             if previous_x_log != self.x_log:
@@ -282,9 +378,10 @@ class GraphPanel(QtWidgets.QWidget):
                     if item is None or curve.id not in self.values:
                         continue
                     x, y = self.values[curve.id]
-                    plan = prepare_plot_data(x, y, x_log=self.x_log)
+                    display_y = masked_y(y, curve.hidden_indices)
+                    plan = prepare_plot_data(x, display_y, x_log=self.x_log)
                     self._configure_plot_item(item, plan)
-                    item.setData(plan.x, plan.y, **plot_kwargs(curve))
+                    item.setData(plan.x, plan.y, **self._curve_plot_options(curve))
                     self.display_values[curve.id] = (plan.x, plan.y)
             self.plot_item.setLogMode(x=self.x_log, y=self.y_log)
             self.plot_item.showGrid(x=self.show_grid, y=self.show_grid, alpha=0.2)
@@ -328,6 +425,8 @@ class GraphPanel(QtWidgets.QWidget):
                 self.plot_item.legend.removeItem(item)
         self.values.pop(curve_id, None)
         self.display_values.pop(curve_id, None)
+        self.selected_points.pop(curve_id, None)
+        self._clear_selection_item(curve_id)
         self.clear_markers()
         self.changed.emit(self.graph_id)
 
@@ -337,15 +436,36 @@ class GraphPanel(QtWidgets.QWidget):
         item.setClipToView(plan.clip_to_view)
         item.setDownsampling(ds=1, auto=plan.auto_downsample, method="peak")
 
+    @staticmethod
+    def _curve_plot_options(spec: CurveSpec) -> dict:
+        options = plot_kwargs(spec)
+        # MPMSのもともとの欠損値、部分消去した点の両方で線を分断。
+        options["connect"] = "finite"
+        return options
+
+    def _refresh_curve_display(self, spec: CurveSpec):
+        """ディスク読み込みや計算をせず、部分消去と描画を更新する。"""
+        if spec.id not in self.values:
+            return
+        x, y = self.values[spec.id]
+        plan = prepare_plot_data(x, masked_y(y, spec.hidden_indices), x_log=self.x_log)
+        self.display_values[spec.id] = (plan.x, plan.y)
+        item = self.items.get(spec.id)
+        if item is not None:
+            self._configure_plot_item(item, plan)
+            item.setData(plan.x, plan.y, **self._curve_plot_options(spec))
+            item.setVisible(spec.visible)
+
     def set_curve_data(self, spec: CurveSpec, record: DataRecord) -> None:
         x, y = calculate_xy(record.array, spec.columns, spec.use_formula,
                             spec.x_expr, spec.y_expr)
         # 元データは解析・マーカー用にそのまま保持する。
         self.values[spec.id] = (x, y)
-        plan = prepare_plot_data(x, y, x_log=self.x_log)
+        # 更新後の行数が短くなっても、範囲外の保存済みインデックスは安全に無視。
+        plan = prepare_plot_data(x, masked_y(y, spec.hidden_indices), x_log=self.x_log)
         self.display_values[spec.id] = (plan.x, plan.y)
         item = self.items.get(spec.id)
-        options = plot_kwargs(spec)
+        options = self._curve_plot_options(spec)
         if item is None:
             item = self.plot_item.plot(plan.x, plan.y, name=spec.name, **options)
             # 線は線上を、点表示の場合はマーカーをダブルクリックして編集できる。
@@ -366,6 +486,7 @@ class GraphPanel(QtWidgets.QWidget):
         item.setVisible(spec.visible)
         self.information.setText(f"曲線: {len(self.curves)}本（ダブルクリックでプロパティ）")
         self.clear_markers()
+        self.clear_point_selection()
         self._last_stable_range = self._range_snapshot()
 
     def _curve_clicked(self, cid: str, event):
@@ -394,21 +515,26 @@ class GraphPanel(QtWidgets.QWidget):
             n = len(x)
             if n == 0:
                 continue
+            available = visible_mask(n, spec.hidden_indices)
+            if not available.any():
+                continue
             stride = max(1, n // 4000)
             sample = np.arange(0, n, stride)
             xs, ys = self._point_to_plot(x[sample], y[sample])
             with np.errstate(all="ignore"):
                 dist = ((xs-point.x()) / xspan*w)**2 + ((ys-point.y())/yspan*h)**2
-            dist[~np.isfinite(dist)] = np.inf
+            dist[~np.isfinite(dist) | ~available[sample]] = np.inf
             idx = int(np.argmin(dist))
             center = int(sample[idx])
             lo, hi = max(0, center-2*stride), min(n, center+2*stride+1)
             cx, cy = self._point_to_plot(x[lo:hi], y[lo:hi])
             with np.errstate(all="ignore"):
                 fine = ((cx-point.x())/xspan*w)**2 + ((cy-point.y())/yspan*h)**2
-            fine[~np.isfinite(fine)] = np.inf
+            fine[~np.isfinite(fine) | ~available[lo:hi]] = np.inf
             ix = int(np.argmin(fine)) + lo
             distance = float(fine[ix-lo])
+            if not np.isfinite(distance):
+                continue
             if best is None or distance < best[2]:
                 best = (spec.id, ix, distance)
         return best
@@ -431,6 +557,13 @@ class GraphPanel(QtWidgets.QWidget):
             self.information.setText(f"曲線: {len(self.curves)}本")
 
     def _mouse_clicked(self, ev):
+        if (getattr(self, "mode", "rect") == "select"
+                and ev.button() == QtCore.Qt.MouseButton.LeftButton
+                and ev.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier):
+            if self.vb.sceneBoundingRect().contains(ev.scenePos()):
+                self.toggle_nearest_selection(ev.scenePos())
+                ev.accept()
+            return
         if getattr(self, "mode", "rect") != "marker" or ev.button() != QtCore.Qt.MouseButton.LeftButton:
             return
         if not self.vb.sceneBoundingRect().contains(ev.scenePos()):
@@ -441,6 +574,106 @@ class GraphPanel(QtWidgets.QWidget):
         cid, idx, _ = near
         self._place_marker(float(self.values[cid][0][idx]), float(self.values[cid][1][idx]))
         ev.accept()
+
+    def select_rectangle(self, xmin: float, xmax: float, ymin: float, ymax: float):
+        """表示中のすべての曲線から範囲内のデータ点を選択する。"""
+        self.clear_point_selection()
+        count = 0
+        for spec in self.curves:
+            if not spec.visible or spec.id not in self.values:
+                continue
+            x, y = self.values[spec.id]
+            xp, yp = self._point_to_plot(x, y)
+            indices = rectangle_indices(xp, yp, (xmin, xmax, ymin, ymax),
+                                        available=visible_mask(len(x), spec.hidden_indices))
+            if len(indices):
+                self.selected_points[spec.id] = set(int(i) for i in indices)
+                count += len(indices)
+        self._refresh_selection_overlays()
+        self.information.setText(f"{count}点を選択しました。「選択点を非表示」で隠せます")
+
+    def toggle_nearest_selection(self, scene_pos):
+        near = self._nearest(scene_pos)
+        if near is None or near[2] > 18**2:
+            return
+        cid, idx, _ = near
+        selected = self.selected_points.setdefault(cid, set())
+        if idx in selected:
+            selected.remove(idx)
+            if not selected:
+                self.selected_points.pop(cid, None)
+        else:
+            selected.add(idx)
+        self._refresh_selection_overlays()
+        self.information.setText(f"{sum(map(len, self.selected_points.values()))}点を選択中")
+
+    def _clear_selection_item(self, cid: str):
+        item = self.selection_items.pop(cid, None)
+        if item is not None:
+            self.plot_item.removeItem(item)
+
+    def _refresh_selection_overlays(self):
+        """選択位置だけ強調する。大量選択では強調点だけ間引き、実際の選択は保持。"""
+        for cid in list(self.selection_items):
+            self._clear_selection_item(cid)
+        for spec in self.curves:
+            indices = self.selected_points.get(spec.id)
+            if not indices or spec.id not in self.values:
+                continue
+            x, y = self.values[spec.id]
+            idx = np.asarray(sorted(indices), dtype=int)
+            idx = idx[(idx >= 0) & (idx < len(x))]
+            if not len(idx):
+                continue
+            if len(idx) > 2000:
+                idx = idx[np.linspace(0, len(idx)-1, 2000).astype(int)]
+            xp, yp = self._point_to_plot(x[idx], y[idx])
+            points = np.isfinite(xp) & np.isfinite(yp)
+            if not np.any(points):
+                continue
+            item = pg.ScatterPlotItem(x=xp[points], y=yp[points], size=8,
+                                      pen=pg.mkPen("#db143e", width=1.5),
+                                      brush=pg.mkBrush(255, 225, 70, 150), pxMode=True)
+            item.setZValue(100)
+            self.plot_item.addItem(item, ignoreBounds=True)
+            self.selection_items[spec.id] = item
+
+    def clear_point_selection(self):
+        self.selected_points.clear()
+        for cid in list(self.selection_items):
+            self._clear_selection_item(cid)
+
+    def hide_selected_points(self):
+        """選択した行番号だけ隠す。元データ・式・他グラフは変更しない。"""
+        count = 0
+        for spec in self.curves:
+            selected = self.selected_points.get(spec.id)
+            if not selected or spec.id not in self.values:
+                continue
+            n = len(self.values[spec.id][0])
+            old = len(spec.hidden_indices)
+            spec.hidden_indices = hide_indices(spec.hidden_indices, selected, n)
+            count += len(spec.hidden_indices) - old
+            self._refresh_curve_display(spec)
+        self.clear_point_selection()
+        self.clear_markers()
+        if count:
+            self.information.setText(f"{count}点を非表示にしました。「すべて表示」で復元できます")
+            self.changed.emit(self.graph_id)
+
+    def show_all_points(self):
+        """グラフ内のすべての曲線の部分消去を解除する。"""
+        changed = False
+        for spec in self.curves:
+            if spec.hidden_indices:
+                spec.hidden_indices = []
+                self._refresh_curve_display(spec)
+                changed = True
+        self.clear_point_selection()
+        self.clear_markers()
+        if changed:
+            self.information.setText("非表示の点をすべて復元しました")
+            self.changed.emit(self.graph_id)
 
     def _place_marker(self, x: float, y: float):
         if len(self._marker_items) >= 2:
@@ -519,7 +752,7 @@ class GraphPanel(QtWidgets.QWidget):
             item = self.items.get(curve.id)
             if item is not None:
                 # データの再計算やディスクの読み直しをせず、見た目だけ変更。
-                item.setData(*self.display_values[curve.id], **plot_kwargs(curve))
+                item.setData(*self.display_values[curve.id], **self._curve_plot_options(curve))
                 legend = self.plot_item.legend
                 if legend is not None:
                     legend.removeItem(item)

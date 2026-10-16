@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph.exporters
 
-from .models import ReaderOptions, CurveSpec, COLORS
+from .models import ReaderOptions, CurveSpec
 from .data_manager import DataManager
 from .file_tree import FileTree
 from .dialogs import ReaderDialog, CurveDialog, message_error
 from .graph_panel import GraphPanel
 from .serialization import save_graph, load_graph, TemplateStore
+from .graph_clone import clone_graph_definition
+from .curve_defaults import initial_curve_spec, matching_reader_options
+from .color_palette import active_curve_colors
+from .sidebar_toggle import SidebarController
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -18,7 +22,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Measurement Viewer v0.1.5")
+        self.setWindowTitle("Measurement Viewer v0.1.15")
         self.resize(1450, 850)
         self.data_manager = DataManager(self)
         self.data_manager.loaded.connect(self._on_data_loaded)
@@ -52,6 +56,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.add_button = QtWidgets.QPushButton("＋ グラフを追加")
         self.add_button.clicked.connect(self.add_graph)
         graph_row.addWidget(self.add_button)
+        duplicate_button = QtWidgets.QPushButton("グラフを複製")
+        duplicate_button.clicked.connect(self.duplicate_selected_graph)
+        graph_row.addWidget(duplicate_button)
         delete_button = QtWidgets.QPushButton("グラフを削除")
         delete_button.clicked.connect(self.delete_selected_graph)
         graph_row.addWidget(delete_button)
@@ -64,12 +71,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_layout.setSpacing(5)
         splitter.addWidget(self.workspace)
         splitter.setSizes([350, 1100])
+
+        # 左側のファイル一覧とグラフ一覧をまとめて折り畳む。
+        # 切替ボタンはツールバーに置くので、折り畳み後も常に操作できる。
+        self.sidebar = sidebar
+        self.splitter = splitter
+        self.sidebar_controller = SidebarController(splitter, sidebar)
+        self.toggle_sidebar_action = QtGui.QAction("◀ サイドバーを隠す", self)
+        self.toggle_sidebar_action.setCheckable(True)
+        self.toggle_sidebar_action.setChecked(True)
+        self.toggle_sidebar_action.setShortcut(QtGui.QKeySequence("Ctrl+B"))
+        self.toggle_sidebar_action.toggled.connect(self._set_sidebar_visible)
+        view_toolbar = QtWidgets.QToolBar("表示", self)
+        view_toolbar.setMovable(False)
+        view_toolbar.addAction(self.toggle_sidebar_action)
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, view_toolbar)
+
         self.statusBar().showMessage("フォルダを開く → グラフを追加 → データをドラッグ＆ドロップ")
         file_menu = self.menuBar().addMenu("ファイル")
         file_menu.addAction("フォルダを開く", self.select_folder, "Ctrl+O")
         file_menu.addAction("グラフを追加", self.add_graph, "Ctrl+N")
+        file_menu.addAction("選択グラフを複製", self.duplicate_selected_graph, "Ctrl+D")
         file_menu.addAction("保存したグラフを開く", self.open_saved_graph)
         file_menu.addAction("選択ファイルを更新", self.refresh_selected, "Ctrl+R")
+        view_menu = self.menuBar().addMenu("表示")
+        view_menu.addAction(self.toggle_sidebar_action)
         template_menu = self.menuBar().addMenu("テンプレート")
         template_menu.addAction("テンプレートを削除", self.delete_template)
         help_menu = self.menuBar().addMenu("ヘルプ")
@@ -79,6 +105,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if sample.is_dir():
             self.tree.select_folder(str(sample))
         self.add_graph()
+
+    def _set_sidebar_visible(self, visible: bool):
+        """ワンクリックでサイドバーを切り替え、ボタンの表示も更新する。"""
+        self.sidebar_controller.set_visible(visible)
+        self.toggle_sidebar_action.setText(
+            "◀ サイドバーを隠す" if visible else "▶ サイドバーを表示"
+        )
 
     def select_folder(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "測定フォルダを選択")
@@ -90,6 +123,7 @@ class MainWindow(QtWidgets.QMainWindow):
         graph.fileDropped.connect(self.on_drop)
         graph.editCurve.connect(self.edit_curve)
         graph.saveRequested.connect(self.save_one_graph)
+        graph.duplicateRequested.connect(self.duplicate_graph)
         graph.exportRequested.connect(self.export_graph)
         graph.templateRequested.connect(self.apply_template)
         graph.saveTemplateRequested.connect(self.save_template)
@@ -150,6 +184,57 @@ class MainWindow(QtWidgets.QMainWindow):
                 graph = self.graphs[gid]
                 item.setText(f"{graph.title_text} ({len(graph.curves)}本)")
 
+    def duplicate_selected_graph(self):
+        """左のグラフ一覧で選んでいるグラフを複製する。"""
+        item = self.graph_list.currentItem()
+        if item is not None:
+            self.duplicate_graph(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        else:
+            self.statusBar().showMessage("複製するグラフを選択してください", 4000)
+
+    def duplicate_graph(self, graph_id: str) -> GraphPanel | None:
+        """曲線・数式・軸範囲・見た目を複製し、新しいグラフを作成する。
+
+        元データはDataManagerのキャッシュを共有するが、CurveSpecと描画要素は
+        新しく生成するため、複製後の設定変更・削除は元のグラフに影響しない。
+        """
+        original = self.graphs.get(graph_id)
+        if original is None:
+            return None
+
+        clone_data = clone_graph_definition(
+            original.to_dict(), (g.title_text for g in self.graphs.values())
+        )
+        graph = self.add_graph(clone_data["settings"]["title"])
+        for curve_data in clone_data.get("curves", []):
+            spec = CurveSpec.from_dict(curve_data)
+            graph.add_curve(spec)
+            record = self.data_manager.get(spec.path)
+            if record is not None:
+                # ディスクから読み直さずにキャッシュ済みデータを用いる。
+                graph.set_curve_data(spec, record)
+            else:
+                # グラフの読み込みがまだ終わっていない場合にも対応。
+                self.data_manager.request(spec.path)
+
+        # データを追加し終えてから軸範囲を復元（自動スケールの影響を防ぐ）。
+        graph.apply_settings(clone_data["settings"], record_history=False)
+        graph.hover_box.setChecked(original.hover_box.isChecked())
+        self._refresh_graph_labels()
+        visible = next(
+            (self.graph_list.item(i).checkState() == QtCore.Qt.CheckState.Checked
+             for i in range(self.graph_list.count())
+             if self.graph_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole) == graph.graph_id),
+            False,
+        )
+        if visible:
+            self.statusBar().showMessage(f"{original.title_text} を {graph.title_text} に複製しました", 6000)
+        else:
+            self.statusBar().showMessage(
+                f"{graph.title_text} を作成しました（同時表示4個のため非表示。左の一覧で切替可能）", 9000
+            )
+        return graph
+
     def delete_selected_graph(self):
         item = self.graph_list.currentItem()
         if item is not None:
@@ -180,6 +265,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._pending_drops.pop(path)
             self._add_curve_dialog(self.graphs[graph_id], self.data_manager.cache[path])
         else:
+            # 同じグラフの直前ファイルとヘッダーが一致する場合は、
+            # カンマ区切り・長いヘッダーなどの読み込み設定も使い回す。
+            # 個別に指定済みの設定や別グラフの設定は上書きしない。
+            if path not in self.data_manager.options and path not in self.data_manager.pending:
+                graph = self.graphs[graph_id]
+                if graph.curves:
+                    previous_record = self.data_manager.get(graph.curves[-1].path)
+                    inherited = matching_reader_options(path, previous_record)
+                    if inherited is not None:
+                        self.data_manager.options[path] = inherited
             self.data_manager.request(path)
             self.statusBar().showMessage(f"読み込み中: {Path(path).name}")
 
@@ -212,12 +307,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"読み込み失敗: {Path(path).name}", 8000)
 
     def _add_curve_dialog(self, graph: GraphPanel, record):
-        idx = len(graph.curves)
-        spec = CurveSpec(path=record.path, name=Path(record.path).stem,
-                         color=COLORS[idx % len(COLORS)],
-                         columns={"x": 0, "y": min(1, len(record.columns)-1),
-                                  "z": min(2, len(record.columns)-1)})
-        dlg = CurveDialog(spec, record, self)
+        # 同じグラフの最後に追加された曲線を参照し、列構造が一致するときだけ
+        # 列の割当、X/Yの式、線幅、マーカー設定などを初期値に使う。
+        # 色は同じグラフで未使用の色を選び、ファイル名とIDも引き継がない。
+        previous = graph.curves[-1] if graph.curves else None
+        previous_record = self.data_manager.get(previous.path) if previous else None
+        spec = initial_curve_spec(
+            record,
+            graph_colors=[curve.color for curve in graph.curves],
+            previous_spec=previous,
+            previous_record=previous_record,
+        )
+        dlg = CurveDialog(spec, record, self,
+                          active_colors=active_curve_colors(self.graphs.values()),
+                          graph_colors=[curve.color for curve in graph.curves])
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             try:
                 # 式のエラーは曲線を追加する前に検出する。
@@ -249,7 +352,9 @@ class MainWindow(QtWidgets.QMainWindow):
         spec = graph.find_curve(curve_id)
         if spec is None:
             return
-        dlg = CurveDialog(spec, record, self, editing=True)
+        dlg = CurveDialog(spec, record, self, editing=True,
+                          active_colors=active_curve_colors(self.graphs.values()),
+                          graph_colors=[curve.color for curve in graph.curves])
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             if dlg.delete_requested:
                 graph.delete_curve(curve_id)
@@ -384,11 +489,16 @@ class MainWindow(QtWidgets.QMainWindow):
 1. 左の「フォルダを開く」で測定データの場所を選択します。
 2. 「グラフを追加」で白紙グラフを作ります。
 3. 左のファイルをグラフにドラッグして列や計算式を指定します。
+   同じ列構造のファイルなら直前の曲線設定が初期値になります。
 4. 左ドラッグで矩形拡大。Panボタンで移動。中ボタンドラッグもPan。
 5. ホイール回転で拡大縮小。Autoで全表示、Undo/Ctrl+Zで範囲を戻せます。
 6. 曲線をダブルクリックして式や色を編集できます。
 7. 2点測定を選んで、グラフを2回クリックするとΔx, Δy, 傾きを表示します。
 8. 軸をクリックすると設定できます。
 9. 左の「更新」は選択ファイルだけ再読み込みします。
-10. 各グラフの「⋯」でJSON保存、画像出力、テンプレート操作ができます。
+10. 左のグラフ一覧または各グラフの「⋯」からグラフを複製できます（Ctrl+D）。
+11. 上の「サイドバーを隠す／表示」（Ctrl+B）で左の2つの一覧をまとめて折り畳めます。
+12. 「部分消去」で左ドラッグ範囲の点を選択、Ctrl+クリックで1点ずつ選択切替。
+13. 「選択点を非表示」で選択点を隠し、「すべて表示」で復元します。Autoは非表示点を除外。
+14. 各グラフの「⋯」でJSON保存、画像出力、テンプレート操作ができます。
 """)

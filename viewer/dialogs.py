@@ -4,8 +4,10 @@ from __future__ import annotations
 from dataclasses import replace
 from PySide6 import QtWidgets, QtCore, QtGui
 
+from .font_settings import get_font_sizes, MIN_FONT_SIZE, MAX_FONT_SIZE
 from .models import ReaderOptions, CurveSpec, DataRecord
 from .curve_style import PLOT_STYLES
+from .color_picker import CurveColorDialog
 from .reader import (
     QUICKLOOK_RAW_LINES, QUICKLOOK_TABLE_ROWS, preview_lines, preview_table
 )
@@ -111,12 +113,16 @@ class ReaderDialog(QtWidgets.QDialog):
 class CurveDialog(QtWidgets.QDialog):
     """ファイルの列をx,y,z,a,b,cへ割り当て、X/Y式と描画属性を編集する。"""
 
-    def __init__(self, spec: CurveSpec, record: DataRecord, parent=None, editing=False):
+    def __init__(self, spec: CurveSpec, record: DataRecord, parent=None, editing=False,
+                 active_colors: list[str] | None = None,
+                 graph_colors: list[str] | None = None):
         super().__init__(parent)
         self.setWindowTitle("曲線のプロパティ" if editing else "グラフにデータを追加")
         self.resize(560, 590)
         self.spec = replace(spec, columns=spec.columns.copy())
         self.delete_requested = False
+        self.active_colors = list(active_colors or [])
+        self.graph_colors = list(graph_colors or [])
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(QtWidgets.QLabel(f"ファイル: {record.path}"))
         form = QtWidgets.QFormLayout()
@@ -195,9 +201,10 @@ class CurveDialog(QtWidgets.QDialog):
         self.color_button.setStyleSheet(f"background-color: {self.color}; color: white")
 
     def choose_color(self):
-        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.color), self)
-        if c.isValid():
-            self.color = c.name()
+        picker = CurveColorDialog(self.color, self.active_colors, self,
+                                  graph_colors=self.graph_colors)
+        if picker.exec() == QtWidgets.QDialog.DialogCode.Accepted and picker.selected_color:
+            self.color = picker.selected_color
             self._set_button_color()
 
     def _confirm_delete(self):
@@ -222,7 +229,7 @@ class CurveDialog(QtWidgets.QDialog):
 
 
 class AxisDialog(QtWidgets.QDialog):
-    """XY軸ラベル・範囲・対数・グリッドの一括設定。"""
+    """XY軸ラベル・範囲・対数・グリッド・文字サイズの一括設定。"""
 
     def __init__(self, settings: dict, parent=None):
         super().__init__(parent)
@@ -245,6 +252,25 @@ class AxisDialog(QtWidgets.QDialog):
                 self.limits[f"{axis}_{edge}"] = edit
                 form.addRow(f"{axis.upper()}軸 {edge}", edit)
         layout.addLayout(form)
+
+        # ラベルと目盛りは上下左右で個別化せず、X/Yで共通にする。
+        font_group = QtWidgets.QGroupBox("フォントサイズ（pt）")
+        font_form = QtWidgets.QFormLayout(font_group)
+        self.font_sizes: dict[str, QtWidgets.QSpinBox] = {}
+        saved_sizes = get_font_sizes(settings)
+        for key, caption in (
+            ("title_font_size", "グラフタイトル"),
+            ("label_font_size", "軸ラベル（X・Y共通）"),
+            ("tick_font_size", "軸目盛り（X・Y共通）"),
+        ):
+            editor = QtWidgets.QSpinBox()
+            editor.setRange(MIN_FONT_SIZE, MAX_FONT_SIZE)
+            editor.setSuffix(" pt")
+            editor.setValue(saved_sizes[key])
+            self.font_sizes[key] = editor
+            font_form.addRow(caption, editor)
+        layout.addWidget(font_group)
+
         self.x_log = QtWidgets.QCheckBox("X軸を対数表示")
         self.y_log = QtWidgets.QCheckBox("Y軸を対数表示")
         self.grid = QtWidgets.QCheckBox("グリッドを表示")
@@ -263,6 +289,7 @@ class AxisDialog(QtWidgets.QDialog):
         data = {"title": self.title.text(), "xlabel": self.xlabel.text(),
                 "ylabel": self.ylabel.text(), "x_log": self.x_log.isChecked(),
                 "y_log": self.y_log.isChecked(), "grid": self.grid.isChecked()}
+        data.update({key: editor.value() for key, editor in self.font_sizes.items()})
         for key, edit in self.limits.items():
             data[key] = float(edit.text()) if edit.text().strip() else None
         for axis in "xy":

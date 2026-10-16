@@ -35,6 +35,7 @@ class CurveSpec:
     plot_style: str = "lines"  # lines / lines_markers / markers
     marker_size: float = 7.0  # マーカーの直径（px）。線幅とは独立
     visible: bool = True
+    hidden_indices: list[int] = field(default_factory=list)  # 部分消去した元データの行番号
     id: str = field(default_factory=new_id)
 
     def to_dict(self) -> dict:
